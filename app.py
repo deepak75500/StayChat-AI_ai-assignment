@@ -26,7 +26,7 @@ from sentence_transformers import SentenceTransformer
 
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
 
-KB_PATH        = r"C:\Users\Deepa\Downloads\taj_mahal_palace_mumbai_kb.txt"
+KB_PATH        = "taj_mahal_palace_mumbai_kb.txt"
 EMBED_MODEL    = "all-MiniLM-L6-v2"           # fast, accurate, free
 GROQ_MODEL     = "llama-3.3-70b-versatile"
 TOP_K          = 5                             # retrieved chunks per query
