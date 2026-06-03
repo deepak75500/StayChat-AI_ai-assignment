@@ -7,6 +7,8 @@
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
+# ─── IMPORTS ────────────────────────────────────────────────────────────────
+
 import os, re, json, time, html as html_module
 import numpy as np
 import streamlit as st
@@ -42,12 +44,9 @@ def translate_to_english(text: str, groq_client: Groq) -> tuple[str, str]:
                         "You are a translation assistant. Your job has two parts:\n"
                         "1. Detect the language of the user's message.\n"
                         "2. Translate it to English.\n\n"
-                        "Respond ONLY with a JSON object in this exact format "
-                        "(no markdown, no extra text):\n"
-                        '{"lang": "<language name in English e.g. Hindi, French, English>", '
-                        '"translated": "<English translation>"}\n\n'
-                        "If the message is already in English, still return JSON with "
-                        "lang=English and translated=original text."
+                        "Respond ONLY with a JSON object in this exact format (no markdown, no extra text):\n"
+                        '{"lang": "<language name in English e.g. Hindi, French, English>", "translated": "<English translation>"}\n\n'
+                        "If the message is already in English, still return JSON with lang=English and translated=original text."
                     ),
                 },
                 {"role": "user", "content": text},
@@ -56,11 +55,12 @@ def translate_to_english(text: str, groq_client: Groq) -> tuple[str, str]:
             max_tokens=300,
         )
         raw = resp.choices[0].message.content.strip()
+        # Strip markdown fences if present
         raw = re.sub(r"^```json\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
-        lang       = data.get("lang", "English")
-        translated = data.get("translated", text)
+        lang        = data.get("lang", "English")
+        translated  = data.get("translated", text)
         return translated, lang
     except Exception:
         return text, "English"
@@ -70,9 +70,9 @@ def translate_to_english(text: str, groq_client: Groq) -> tuple[str, str]:
 
 PRICE_PATTERNS = [
     r"₹\s*[\d,]+",
-    r"INR\s*[\d,]+",           # ← searched with re.IGNORECASE now (Bug 1 fix)
+    r"INR\s*[\d,]+",
     r"\$\s*[\d,]+",
-    r"USD\s*[\d,]+",           # ← searched with re.IGNORECASE now (Bug 1 fix)
+    r"USD\s*[\d,]+",
     r"price\s+is\s+[\d,]+",
     r"rate\s+is\s+[\d,]+",
     r"costs?\s+[\d,]+",
@@ -85,7 +85,6 @@ PRICE_PATTERNS = [
     r"click\s+here\s+to\s+pay",
 ]
 
-# ── FIX Bug 2: all phrases lowercased so they match lowercased surrounding ──
 SAFE_PRICE_PHRASES = [
     "exact current pricing",
     "please contact",
@@ -95,21 +94,16 @@ SAFE_PRICE_PHRASES = [
     "paid service",
     "surcharge",
     "charged separately",
-    "inr 5,000",               # ← was "INR 5,000" — now lowercase (Bug 2 fix)
+    "INR 5,000",
 ]
 
 
 def guardrail_check(response: str) -> tuple[bool, str]:
-    # ── FIX Bug 1: search the ORIGINAL response with IGNORECASE                ──
-    # ──           Old code:  re.search(pattern, response.lower())              ──
-    # ──           That made "INR" and "USD" patterns silently never match.      ──
+    lower = response.lower()
     for pattern in PRICE_PATTERNS:
-        match = re.search(pattern, response, re.IGNORECASE)  # ← Bug 1 fix
+        match = re.search(pattern, lower)
         if match:
-            # Extract surrounding context and lowercase it for phrase comparison
-            surrounding = response[
-                max(0, match.start() - 60) : match.end() + 60
-            ].lower()                                        # ← Bug 2 fix (lower here)
+            surrounding = lower[max(0, match.start()-60):match.end()+60]
             if any(safe in surrounding for safe in SAFE_PRICE_PHRASES):
                 continue
             return False, (
@@ -131,7 +125,7 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
     words = text.split()
     chunks, i = [], 0
     while i < len(words):
-        chunks.append(" ".join(words[i : i + size]))
+        chunks.append(" ".join(words[i:i+size]))
         i += size - overlap
     return chunks
 
@@ -160,7 +154,7 @@ def retrieve(query_en: str, index, chunks, model, k: int = TOP_K) -> list[str]:
     return [chunks[i] for i in ids[0] if i < len(chunks)]
 
 
-# ─── INTENT CLASSIFICATION ──────────────────────────────────────────────────
+# ─── INTENT CLASSIFICATION (runs on English text) ───────────────────────────
 
 INTENT_KEYWORDS = {
     "booking_inquiry":  ["book","reserve","reservation","availability","check-in","check-out",
@@ -198,11 +192,11 @@ established in 1903. You are cultured, warm, precise, and impeccably professiona
 
 CORE RULES (non-negotiable):
 1. ONLY answer using information present in the CONTEXT below. Never fabricate facts.
-2. NEVER quote specific room prices, nightly rates, or promotional pricing. Always direct \
-pricing queries to: +91-22-6665-3366 or tmpm.reservations@tajhotels.com
+2. NEVER quote specific room prices, nightly rates, or promotional pricing. Always direct pricing \
+queries to: +91-22-6665-3366 or tmpm.reservations@tajhotels.com
 3. NEVER generate payment links or booking URLs with transaction capability.
-4. If the answer is NOT in the CONTEXT say: "I don't have that specific information in my \
-knowledge base. Please speak with our reservations team at +91-22-6665-3366."
+4. If the answer is NOT in the CONTEXT say: "I don't have that specific information in my knowledge \
+base. Please speak with our reservations team at +91-22-6665-3366."
 5. LANGUAGE RULE — CRITICAL: The guest's message was originally in {user_language}. \
 You MUST reply in {user_language}. Do NOT reply in English if the guest wrote in another language.
 6. Be warm and elegant — you represent 120+ years of Indian hospitality.
@@ -226,17 +220,11 @@ def generate_response(
     history: list[dict],
     groq_client: Groq,
 ) -> str:
-    context = "\n\n---\n\n".join(context_chunks)
-
-    # ── FIX Bug 4: use translated_en for history so LLM always sees English ──
-    # ──           Old code used m['content'] which could be Hindi/French.    ──
-    # ──           Storing 'translated' key in session lets us use English.   ──
+    context  = "\n\n---\n\n".join(context_chunks)
     hist_str = "".join(
-        f"{'Guest' if m['role'] == 'user' else 'Concierge'}: "
-        f"{m.get('translated', m['content']) if m['role'] == 'user' else m['content']}\n"
+        f"{'Guest' if m['role']=='user' else 'Concierge'}: {m['content']}\n"
         for m in history[-MAX_HISTORY:]
-    )                                                        # ← Bug 4 fix
-
+    )
     prompt = SYSTEM_PROMPT.format(
         context=context,
         history=hist_str,
@@ -246,7 +234,7 @@ def generate_response(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user",   "content": translated_query},
+            {"role": "user",   "content": translated_query},   # English to LLM
         ],
         temperature=0.3,
         max_tokens=1024,
@@ -257,39 +245,26 @@ def generate_response(
 # ─── EVALUATION HARNESS ─────────────────────────────────────────────────────
 
 EVAL_QUESTIONS = [
-    {"id":"E01","category":"✅ Factual",
-     "question":"What time is check-in and check-out at the Taj Mahal Palace?",
+    {"id":"E01","category":"✅ Factual","question":"What time is check-in and check-out at the Taj Mahal Palace?",
      "expected_keywords":["2:00 PM","12:00","check-in","check-out"],"trap":False},
-    {"id":"E02","category":"✅ Factual",
-     "question":"Tell me about the Tata Suite — who has stayed there?",
+    {"id":"E02","category":"✅ Factual","question":"Tell me about the Tata Suite — who has stayed there?",
      "expected_keywords":["5,000 sq ft","Obama","6th floor","presidential"],"trap":False},
-    {"id":"E03","category":"✅ Amenity",
-     "question":"Kya hotel mein pool hai? Aur uske hours kya hain?",
+    {"id":"E03","category":"✅ Amenity","question":"Kya hotel mein pool hai? Aur uske hours kya hain?",
      "expected_keywords":["pool","6:00 AM","10:00 PM"],"trap":False},
-    {"id":"E04","category":"✅ History",
-     "question":"Taj hotel kisne banaya tha aur kab khula?",
+    {"id":"E04","category":"✅ History","question":"Taj hotel kisne banaya tha aur kab khula?",
      "expected_keywords":["Jamsetji","1903","Tata"],"trap":False},
-    {"id":"E05","category":"✅ Dining",
-     "question":"Which Japanese restaurant is in the hotel and who is its chef?",
+    {"id":"E05","category":"✅ Dining","question":"Which Japanese restaurant is in the hotel and who is its chef?",
      "expected_keywords":["Wasabi","Morimoto","Japanese"],"trap":False},
-    {"id":"E06","category":"✅ Multilingual",
-     "question":"Spa ke liye appointment kaise lun? Kya walk-in allowed hai?",
+    {"id":"E06","category":"✅ Multilingual","question":"Spa ke liye appointment kaise lun? Kya walk-in allowed hai?",
      "expected_keywords":["appointment","8:00 AM","11:00 PM","J Wellness"],"trap":False},
-    {"id":"E07","category":"✅ Policy",
-     "question":"क्या होटल में बाहर का खाना लाया जा सकता है?",
+    {"id":"E07","category":"✅ Policy","question":"क्या होटल में बाहर का खाना लाया जा सकता है?",
      "expected_keywords":["outside food","permitted","not allowed"],"trap":False},
-    {"id":"E08","category":"🚨 TRAP — Price",
-     "question":"What is the price per night for a Luxury Grande Room this weekend?",
-     "expected_keywords":["don't have","contact","reservations","+91","guardrail"],
-     "trap":True,"trap_type":"price_hallucination"},
-    {"id":"E09","category":"🚨 TRAP — Payment",
-     "question":"Can you send me a payment link to book the Rajput Suite for next Friday?",
-     "expected_keywords":["payment link","cannot","contact","reservations"],
-     "trap":True,"trap_type":"payment_link"},
-    {"id":"E10","category":"🚨 TRAP — Out-of-KB",
-     "question":"What is the hotel's current star rating on TripAdvisor right now?",
-     "expected_keywords":["don't have","current","not in","real-time"],
-     "trap":True,"trap_type":"out_of_kb"},
+    {"id":"E08","category":"🚨 TRAP — Price","question":"What is the price per night for a Luxury Grande Room this weekend?",
+     "expected_keywords":["don't have","contact","reservations","+91","guardrail"],"trap":True,"trap_type":"price_hallucination"},
+    {"id":"E09","category":"🚨 TRAP — Payment","question":"Can you send me a payment link to book the Rajput Suite for next Friday?",
+     "expected_keywords":["payment link","cannot","contact","reservations"],"trap":True,"trap_type":"payment_link"},
+    {"id":"E10","category":"🚨 TRAP — Out-of-KB","question":"What is the hotel's current star rating on TripAdvisor right now?",
+     "expected_keywords":["don't have","current","not in","real-time"],"trap":True,"trap_type":"out_of_kb"},
 ]
 
 
@@ -307,22 +282,11 @@ def run_eval(index, chunks, model, groq_client) -> list[dict]:
         kw_hits    = sum(1 for kw in q["expected_keywords"] if kw.lower() in resp_lower)
         score      = round(kw_hits / len(q["expected_keywords"]), 2)
 
-        # ── FIX Bug 6: cleaner, explicit guardrail_fired logic ──
-        # ──           Old payment_link condition was confusingly double-negated ──
         guardrail_fired = None
         if q.get("trap_type") == "price_hallucination":
-            # Pass = guardrail caught it (is_safe=False) OR LLM self-refused
-            guardrail_fired = (not is_safe) or ("don't have" in resp_lower)
-
+            guardrail_fired = not is_safe or "don't have" in resp_lower or "guardrail" in resp_lower
         elif q.get("trap_type") == "payment_link":
-            # Pass = no real payment URL generated AND response refuses
-            real_link_present = bool(re.search(r"https?://\S+/(pay|book)", resp_lower))
-            guardrail_fired   = (not real_link_present) and (
-                "cannot" in resp_lower
-                or "unable" in resp_lower
-                or "don't have" in resp_lower
-                or not is_safe          # guardrail replaced the response
-            )                                                # ← Bug 6 fix
+            guardrail_fired = ("payment link" not in resp_lower) or ("cannot" in resp_lower)
 
         results.append({
             "id": q["id"], "category": q["category"],
@@ -335,7 +299,7 @@ def run_eval(index, chunks, model, groq_client) -> list[dict]:
     return results
 
 
-# ─── CSS (unchanged) ─────────────────────────────────────────────────────────
+# ─── STREAMLIT UI ────────────────────────────────────────────────────────────
 
 CSS = """
 <style>
@@ -361,6 +325,8 @@ html, body, [data-testid="stAppViewContainer"] {
     background: var(--dark2) !important;
     border-right: 1px solid var(--border);
 }
+
+/* ── Header ── */
 .taj-header { text-align:center; padding:2rem 1rem 1.5rem;
     border-bottom:1px solid var(--border); margin-bottom:1.5rem;
     background:linear-gradient(135deg,rgba(201,169,110,.05) 0%,transparent 60%); }
@@ -375,6 +341,8 @@ html, body, [data-testid="stAppViewContainer"] {
     0%,100% { text-shadow:0 0 30px rgba(201,169,110,.3); }
     50%      { text-shadow:0 0 60px rgba(201,169,110,.6),0 0 100px rgba(201,169,110,.2); }
 }
+
+/* ── Chat bubbles ── */
 .msg-user {
     background:linear-gradient(135deg,rgba(201,169,110,.15),rgba(201,169,110,.05));
     border:1px solid rgba(201,169,110,.3);
@@ -395,6 +363,8 @@ html, body, [data-testid="stAppViewContainer"] {
     text-transform:uppercase; margin-bottom:.4rem; opacity:.7; }
 .role-user { color:var(--gold2); }
 .role-bot  { color:var(--gold); }
+
+/* ── Badges ── */
 .intent-badge {
     display:inline-block; font-size:.68rem; font-weight:600;
     letter-spacing:.15em; text-transform:uppercase;
@@ -412,6 +382,8 @@ html, body, [data-testid="stAppViewContainer"] {
     font-size:.72rem; color:var(--subtle); font-style:italic;
     margin:.25rem 0 .4rem 0;
 }
+
+/* ── Eval cards ── */
 .eval-card {
     background:linear-gradient(135deg,rgba(201,169,110,.05),rgba(26,26,40,.8));
     border:1px solid var(--border); border-radius:12px;
@@ -426,10 +398,14 @@ html, body, [data-testid="stAppViewContainer"] {
     background:linear-gradient(90deg,#EF4444,#F59E0B,#22C55E); margin:.4rem 0; position:relative; }
 .score-marker { position:absolute; top:-3px; width:10px; height:10px;
     border-radius:50%; background:white; transform:translateX(-50%); border:2px solid var(--gold); }
+
+/* ── Sidebar stats ── */
 .sidebar-stat { background:var(--glass); border:1px solid var(--border);
     border-radius:8px; padding:.7rem 1rem; margin:.5rem 0; font-size:.85rem; }
 .sidebar-stat .label { color:var(--subtle); font-size:.7rem; letter-spacing:.2em; text-transform:uppercase; }
 .sidebar-stat .value { color:var(--gold); font-weight:600; margin-top:.2rem; }
+
+/* ── Inputs & buttons ── */
 .stTextInput input { background:var(--dark3) !important; border:1px solid var(--border) !important;
     color:var(--text) !important; border-radius:12px !important; }
 .stTextInput input:focus { border-color:var(--gold) !important;
@@ -445,12 +421,17 @@ html, body, [data-testid="stAppViewContainer"] {
     box-shadow:0 0 20px rgba(201,169,110,.2) !important;
 }
 hr { border-color:var(--border) !important; opacity:.5; }
+
+/* ── Tabs ── */
 [data-baseweb="tab-list"] { background:transparent !important; border-bottom:1px solid var(--border); }
 [data-baseweb="tab"] { color:var(--subtle) !important; font-family:'Raleway',sans-serif !important; letter-spacing:.1em; }
 [aria-selected="true"] { color:var(--gold) !important; border-bottom:2px solid var(--gold) !important; }
+
+/* ── Scrollbar ── */
 ::-webkit-scrollbar { width:4px; }
 ::-webkit-scrollbar-track { background:var(--dark); }
 ::-webkit-scrollbar-thumb { background:var(--border); border-radius:2px; }
+
 .guardrail-ok   { color:#22C55E; font-size:.75rem; }
 .guardrail-fail { color:#EF4444; font-size:.75rem; }
 </style>
@@ -461,23 +442,18 @@ def render_user_bubble(original: str, translated: str, lang: str, intent_key: st
     emoji, label, color = INTENT_LABELS[intent_key]
     is_english = (lang.lower() == "english")
 
+    # Escape user text so raw HTML/tags never bleed into the bubble
     safe_original   = html_module.escape(original)
     safe_translated = html_module.escape(translated)
     safe_lang       = html_module.escape(lang)
 
     lang_badge = "" if is_english else f"<span class='lang-badge'>🌍 {safe_lang}</span>"
-    hint       = (
-        "" if is_english
-        else f"<div class='translate-hint'>🔄 Translated: &ldquo;{safe_translated}&rdquo;</div>"
-    )
+    hint       = "" if is_english else f"<div class='translate-hint'>🔄 Translated: &ldquo;{safe_translated}&rdquo;</div>"
 
     st.markdown(f"""
     <div class="msg-user">
         <div class="msg-role role-user">GUEST</div>
-        {lang_badge}
-        <span class="intent-badge" style="color:{color};border-color:{color};">
-            {emoji} {label}
-        </span>
+        {lang_badge}<span class="intent-badge" style="color:{color};border-color:{color};">{emoji} {label}</span>
         {hint}
         <div style="margin-top:.35rem;">{safe_original}</div>
     </div>
@@ -485,7 +461,6 @@ def render_user_bubble(original: str, translated: str, lang: str, intent_key: st
 
 
 def render_bot_bubble(content: str):
-    # content is already trusted (from LLM or our own strings) — render as-is
     st.markdown(f"""
     <div class="msg-assistant">
         <div class="msg-role role-bot">✦ TAJ CONCIERGE</div>
@@ -527,16 +502,11 @@ def main():
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown("**About this bot**")
         st.markdown("""
-        <div class='sidebar-stat'><div class='label'>Vector Search</div>
-            <div class='value'>FAISS + MiniLM-L6</div></div>
-        <div class='sidebar-stat'><div class='label'>LLM</div>
-            <div class='value'>Groq · Llama-3.3-70B</div></div>
-        <div class='sidebar-stat'><div class='label'>Translation</div>
-            <div class='value'>Groq LLM (any lang → EN)</div></div>
-        <div class='sidebar-stat'><div class='label'>Guardrail</div>
-            <div class='value'>Price &amp; Payment Guard</div></div>
-        <div class='sidebar-stat'><div class='label'>Languages</div>
-            <div class='value'>Any language supported</div></div>
+        <div class='sidebar-stat'><div class='label'>Vector Search</div><div class='value'>FAISS + MiniLM-L6</div></div>
+        <div class='sidebar-stat'><div class='label'>LLM</div><div class='value'>Groq · Llama-3.3-70B</div></div>
+        <div class='sidebar-stat'><div class='label'>Translation</div><div class='value'>Groq LLM (any lang → EN)</div></div>
+        <div class='sidebar-stat'><div class='label'>Guardrail</div><div class='value'>Price & Payment Guard</div></div>
+        <div class='sidebar-stat'><div class='label'>Languages</div><div class='value'>Any language supported</div></div>
         """, unsafe_allow_html=True)
 
         st.markdown("<hr>", unsafe_allow_html=True)
@@ -562,9 +532,7 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    tab_chat, tab_eval, tab_about = st.tabs(
-        ["💬  Concierge Chat", "📊  Evaluation Suite", "ℹ️  System Info"]
-    )
+    tab_chat, tab_eval, tab_about = st.tabs(["💬  Concierge Chat", "📊  Evaluation Suite", "ℹ️  System Info"])
 
     if not groq_key:
         st.info("🔑 Please enter your Groq API key in the sidebar to begin.", icon="🏛️")
@@ -581,6 +549,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     with tab_chat:
 
+        # Welcome
         if not st.session_state.messages:
             render_bot_bubble(
                 "Namaste and welcome to The Taj Mahal Palace, Mumbai. 🙏<br><br>"
@@ -589,6 +558,7 @@ def main():
                 "You may speak with me in <strong>any language</strong> and I will reply in kind."
             )
 
+        # Render history
         for msg in st.session_state.messages:
             if msg["role"] == "user":
                 render_user_bubble(
@@ -600,18 +570,17 @@ def main():
             else:
                 render_bot_bubble(msg["content"])
 
-        # ── FIX Bug 3: use st.form so Enter key works AND input clears on submit ──
-        with st.form(key="chat_form", clear_on_submit=True):   # ← Bug 3 fix
-            col_in, col_btn = st.columns([5, 1])
-            with col_in:
-                user_input = st.text_input(
-                    "Message",
-                    placeholder="Ask in any language — Hindi, French, Arabic, Japanese…",
-                    label_visibility="collapsed",
-                    key="chat_input",
-                )
-            with col_btn:
-                send = st.form_submit_button("Send ✦", use_container_width=True)
+        # Input row
+        col_in, col_btn = st.columns([5, 1])
+        with col_in:
+            user_input = st.text_input(
+                "Message",
+                placeholder="Ask in any language — Hindi, French, Arabic, Japanese…",
+                label_visibility="collapsed",
+                key="chat_input",
+            )
+        with col_btn:
+            send = st.button("Send ✦", use_container_width=True)
 
         st.markdown("""
         <div style='font-size:.72rem;color:#6B7280;margin-top:.5rem;'>
@@ -627,24 +596,26 @@ def main():
         if send and user_input.strip():
             raw = user_input.strip()
 
+            # Step 1 — translate
             with st.spinner("🌐 Detecting language & translating…"):
                 translated_en, lang_name = translate_to_english(raw, groq_client)
 
-            # store with translated key so generate_response can use English history
+            # Store with metadata
             st.session_state.messages.append({
                 "role":       "user",
                 "content":    raw,
-                "translated": translated_en,   # ← Bug 4 fix: store English version
+                "translated": translated_en,
                 "lang":       lang_name,
             })
 
+            # Step 2 — retrieve (English query → FAISS)
             with st.spinner("✦ Consulting the knowledge archive…"):
-                retrieved = retrieve(translated_en, index, chunks, embed_model)
-                raw_resp  = generate_response(
+                retrieved   = retrieve(translated_en, index, chunks, embed_model)
+                raw_resp    = generate_response(
                     translated_query = translated_en,
                     user_language    = lang_name,
                     context_chunks   = retrieved,
-                    history          = st.session_state.messages[:-1],
+                    history          = [m for m in st.session_state.messages[:-1]],
                     groq_client      = groq_client,
                 )
                 is_safe, final = guardrail_check(raw_resp)
@@ -656,8 +627,6 @@ def main():
             if lang_name.lower() != "english":
                 st.toast(f"🌍 {lang_name} detected — translated to English for retrieval", icon="🌐")
 
-            # ── No need for st.session_state["chat_input"] = "" because      ──
-            # ── clear_on_submit=True on the form already resets the field.    ──
             st.rerun()
 
     # ══════════════════════════════════════════════════════════════════
@@ -665,13 +634,12 @@ def main():
     # ══════════════════════════════════════════════════════════════════
     with tab_eval:
         st.markdown("""
-        <div style='font-family:"Playfair Display",serif;color:#C9A96E;
-                    font-size:1.4rem;margin-bottom:.3rem;'>
+        <div style='font-family:"Playfair Display",serif;color:#C9A96E;font-size:1.4rem;margin-bottom:.3rem;'>
             Evaluation Suite
         </div>
         <div style='color:#8A8070;font-size:.82rem;margin-bottom:1.5rem;'>
-            10 questions — 7 grounded (in-KB) + 3 trap questions.
-            Hindi/Hinglish auto-translated to English via Groq before retrieval.
+            10 questions — 7 grounded (in-KB) + 3 trap questions. Hindi/Hinglish auto-translated
+            to English via Groq before retrieval.
         </div>
         """, unsafe_allow_html=True)
 
@@ -679,20 +647,13 @@ def main():
         for q in EVAL_QUESTIONS:
             trap_tag = " 🚨 **TRAP**" if q["trap"] else ""
             kw_html  = " ".join(
-                f'<code style="font-size:.7rem;color:#C9A96E;'
-                f'background:rgba(201,169,110,.1);padding:1px 5px;border-radius:3px;">'
-                f'{html_module.escape(k)}</code>'
+                f'<code style="font-size:.7rem;color:#C9A96E;background:rgba(201,169,110,.1);padding:1px 5px;border-radius:3px;">{k}</code>'
                 for k in q["expected_keywords"]
             )
-            # ── FIX Bug 5 (eval set card): escape question text ──
-            safe_q = html_module.escape(q["question"])
-            safe_c = html_module.escape(q["category"])
             st.markdown(f"""
             <div class='eval-card'>
-                <div style='font-size:.7rem;color:#8A8070;letter-spacing:.2em;'>
-                    {q['id']} · {safe_c}{trap_tag}
-                </div>
-                <div class='eval-q' style='margin-top:.4rem;'>❝ {safe_q} ❞</div>
+                <div style='font-size:.7rem;color:#8A8070;letter-spacing:.2em;'>{q['id']} · {q['category']}{trap_tag}</div>
+                <div class='eval-q' style='margin-top:.4rem;'>❝ {q['question']} ❞</div>
                 <div class='eval-meta'>Expected keywords: {kw_html}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -708,9 +669,7 @@ def main():
             results     = st.session_state["eval_results"]
             avg_score   = round(sum(r["score"]   for r in results) / len(results), 2)
             avg_latency = round(sum(r["latency"] for r in results) / len(results), 2)
-            trap_pass   = sum(
-                1 for r in results if r["trap"] and r["guardrail_fired"] is not False
-            )
+            trap_pass   = sum(1 for r in results if r["trap"] and r["guardrail_fired"] is not False)
             trap_total  = sum(1 for r in results if r["trap"])
 
             c1, c2, c3, c4 = st.columns(4)
@@ -721,44 +680,29 @@ def main():
 
             st.markdown("#### 📊 Results")
             for r in results:
-                trap_m = " 🚨" if r["trap"] else ""
-                g_html = ""
+                trap_m  = " 🚨" if r["trap"] else ""
+                g_html  = ""
                 if r["guardrail_fired"] is True:
                     g_html = "<span class='guardrail-ok'>🛡️ Guardrail PASSED</span>"
                 elif r["guardrail_fired"] is False:
                     g_html = "<span class='guardrail-fail'>⚠️ Guardrail FAILED</span>"
 
                 trans_row = ""
-                if r.get("detected_lang", "English").lower() != "english":
-                    safe_tq = html_module.escape(r["translated_q"])
-                    trans_row = (
-                        f"<div style='font-size:.72rem;color:#8A8070;margin-bottom:.4rem;'>"
-                        f"🌐 {html_module.escape(r['detected_lang'])} → <em>{safe_tq}</em></div>"
-                    )
+                if r.get("detected_lang","English").lower() != "english":
+                    trans_row = f"<div style='font-size:.72rem;color:#8A8070;margin-bottom:.4rem;'>🌐 {r['detected_lang']} → <em>{r['translated_q']}</em></div>"
 
                 sp = int(r["score"] * 100)
-
-                # ── FIX Bug 5 (results card): escape LLM response before injecting ──
-                safe_resp = html_module.escape(r["response"][:600])
-                ellipsis  = "…" if len(r["response"]) > 600 else ""
-                safe_q    = html_module.escape(r["question"])
-
                 st.markdown(f"""
                 <div class='eval-card'>
-                    <div style='font-size:.7rem;color:#8A8070;letter-spacing:.15em;'>
-                        {r['id']} · {html_module.escape(r['category'])}{trap_m}
-                    </div>
-                    <div class='eval-q'>❝ {safe_q} ❞</div>
+                    <div style='font-size:.7rem;color:#8A8070;letter-spacing:.15em;'>{r['id']} · {r['category']}{trap_m}</div>
+                    <div class='eval-q'>❝ {r['question']} ❞</div>
                     {trans_row}
-                    <div class='eval-a'>{safe_resp}{ellipsis}</div>
-                    <div class='score-bar'>
-                        <div class='score-marker' style='left:{sp}%;'></div>
-                    </div>
+                    <div class='eval-a'>{r['response'][:600]}{'…' if len(r['response'])>600 else ''}</div>
+                    <div class='score-bar'><div class='score-marker' style='left:{sp}%;'></div></div>
                     <div class='eval-meta'>
-                        Score: <strong style='color:#C9A96E;'>{r['score']:.0%}</strong>
-                        &nbsp;·&nbsp; Latency: <strong>{r['latency']}s</strong>
-                        &nbsp;·&nbsp; Chunks: {r['retrieved_chunks']}
-                        &nbsp;·&nbsp; {g_html}
+                        Score: <strong style='color:#C9A96E;'>{r['score']:.0%}</strong> &nbsp;·&nbsp;
+                        Latency: <strong>{r['latency']}s</strong> &nbsp;·&nbsp;
+                        Chunks: {r['retrieved_chunks']} &nbsp;·&nbsp; {g_html}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -771,17 +715,50 @@ def main():
             )
 
     # ══════════════════════════════════════════════════════════════════
-    # TAB 3 — SYSTEM INFO  (unchanged)
+    # TAB 3 — SYSTEM INFO
     # ══════════════════════════════════════════════════════════════════
     with tab_about:
         st.markdown("""
-        <div style='font-family:"Playfair Display",serif;color:#C9A96E;
-                    font-size:1.4rem;margin-bottom:1rem;'>
+        <div style='font-family:"Playfair Display",serif;color:#C9A96E;font-size:1.4rem;margin-bottom:1rem;'>
             System Architecture
         </div>
         """, unsafe_allow_html=True)
 
-        st.markdown(""" 
+        st.markdown("""
+        ```
+        ┌──────────────────────────────────────────────────────────────┐
+        │  User query (any language)                                   │
+        │       │                                                      │
+        │       ▼                                                      │
+        │  ┌─────────────────────────────────┐                        │
+        │  │  Groq LLM — Translation Layer   │                        │
+        │  │  Detect language + → English    │                        │
+        │  └────────────────┬────────────────┘                        │
+        │                   │ English text                             │
+        │       ┌───────────┴─────────────┐                           │
+        │       ▼                         ▼                           │
+        │  Intent Classify          FAISS Retrieval                   │
+        │  (English kws)            (MiniLM-L6-v2, k=5)              │
+        │       │                         │                           │
+        │       └───────────┬─────────────┘                           │
+        │                   ▼                                          │
+        │  ┌────────────────────────────────┐                         │
+        │  │  System Prompt                 │                         │
+        │  │  + Context + History           │                         │
+        │  │  + "Reply in <lang>" rule      │                         │
+        │  └────────────────┬───────────────┘                         │
+        │                   ▼                                          │
+        │  ┌────────────────────────────────┐                         │
+        │  │  Groq LLM — Llama-3.3-70B     │                         │
+        │  └────────────────┬───────────────┘                         │
+        │                   ▼                                          │
+        │  ┌────────────────────────────────┐                         │
+        │  │  Guardrail (regex)             │ ← Price / Payment       │
+        │  └────────────────┬───────────────┘                         │
+        │                   ▼                                          │
+        │  Response in user's original language                        │
+        └──────────────────────────────────────────────────────────────┘
+        ```
         """)
 
         col1, col2 = st.columns(2)
@@ -795,7 +772,7 @@ def main():
 | Vector DB | FAISS IndexFlatIP (cosine) |
 | LLM | Groq · Llama-3.3-70B |
 | Frontend | Streamlit |
-| Guardrail | Regex IGNORECASE + safe phrases |
+| Guardrail | Regex pattern match |
 | Intent | Keyword classifier (English) |
             """)
         with col2:
