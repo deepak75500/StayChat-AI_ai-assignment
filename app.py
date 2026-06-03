@@ -9,7 +9,7 @@
 
 # ─── IMPORTS ────────────────────────────────────────────────────────────────
 
-import os, re, json, time
+import os, re, json, time, html as html_module
 import numpy as np
 import streamlit as st
 from groq import Groq
@@ -442,15 +442,20 @@ def render_user_bubble(original: str, translated: str, lang: str, intent_key: st
     emoji, label, color = INTENT_LABELS[intent_key]
     is_english = (lang.lower() == "english")
 
-    lang_badge = "" if is_english else f"<span class='lang-badge'>🌍 {lang}</span>"
-    hint       = "" if is_english else f"<div class='translate-hint'>🔄 Translated: \"{translated}\"</div>"
+    # Escape user text so raw HTML/tags never bleed into the bubble
+    safe_original   = html_module.escape(original)
+    safe_translated = html_module.escape(translated)
+    safe_lang       = html_module.escape(lang)
+
+    lang_badge = "" if is_english else f"<span class='lang-badge'>🌍 {safe_lang}</span>"
+    hint       = "" if is_english else f"<div class='translate-hint'>🔄 Translated: &ldquo;{safe_translated}&rdquo;</div>"
 
     st.markdown(f"""
     <div class="msg-user">
         <div class="msg-role role-user">GUEST</div>
         {lang_badge}<span class="intent-badge" style="color:{color};border-color:{color};">{emoji} {label}</span>
         {hint}
-        <div style="margin-top:.35rem;">{original}</div>
+        <div style="margin-top:.35rem;">{safe_original}</div>
     </div>
     """, unsafe_allow_html=True)
 
