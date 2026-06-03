@@ -277,7 +277,7 @@ The chatbot must refuse these requests safely.
 ### Clone Repository
 
 ```bash
-git clone https://github.com/your-username/taj-concierge-rag.git
+git clone https://github.com/deepak75500/StayChat-AI_ai-assignment.git
 cd taj-concierge-rag
 ```
 
