@@ -43,8 +43,7 @@ taj-concierge/
 ├── taj_mahal_palace_mumbai_kb.txt
 ├── requirements.txt
 ├── README.md
-└── .streamlit/
-    └── config.toml
+
 ```
 
 ---
