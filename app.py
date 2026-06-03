@@ -442,23 +442,34 @@ def render_user_bubble(original: str, translated: str, lang: str, intent_key: st
     emoji, label, color = INTENT_LABELS[intent_key]
     is_english = (lang.lower() == "english")
 
-    # Escape user text so raw HTML/tags never bleed into the bubble
     safe_original   = html_module.escape(original)
     safe_translated = html_module.escape(translated)
     safe_lang       = html_module.escape(lang)
 
-    lang_badge = "" if is_english else f"<span class='lang-badge'>🌍 {safe_lang}</span>"
-    hint       = "" if is_english else f"<div class='translate-hint'>🔄 Translated: &ldquo;{safe_translated}&rdquo;</div>"
+    # Build parts into a list — no empty strings that leave blank lines
+    parts = ['<div class="msg-role role-user">GUEST</div>']
 
-    st.markdown(f"""
-    <div class="msg-user">
-        <div class="msg-role role-user">GUEST</div>
-        {lang_badge}<span class="intent-badge" style="color:{color};border-color:{color};">{emoji} {label}</span>
-        {hint}
-        <div style="margin-top:.35rem;">{safe_original}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    if not is_english:
+        parts.append(f"<span class='lang-badge'>🌍 {safe_lang}</span>")
 
+    parts.append(
+        f"<span class='intent-badge' style='color:{color};border-color:{color};'>"
+        f"{emoji} {label}</span>"
+    )
+
+    if not is_english:
+        parts.append(
+            f"<div class='translate-hint'>🔄 Translated: &ldquo;{safe_translated}&rdquo;</div>"
+        )
+
+    parts.append(f"<div style='margin-top:.35rem;'>{safe_original}</div>")
+
+    # Join with no blank lines — blank lines break Streamlit's HTML parser
+    inner = "".join(parts)
+    st.markdown(
+        f"<div class='msg-user'>{inner}</div>",
+        unsafe_allow_html=True,
+    )
 
 def render_bot_bubble(content: str):
     st.markdown(f"""
