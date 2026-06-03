@@ -1,0 +1,8 @@
+# Taj Mahal Palace AI Concierge — Requirements
+# Install with: pip install -r requirements.txt
+
+streamlit>=1.35.0
+faiss-cpu>=1.8.0
+sentence-transformers>=2.7.0
+groq>=0.9.0
+numpy>=1.26.0
