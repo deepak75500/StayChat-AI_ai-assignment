@@ -3,6 +3,7 @@
 ║   THE TAJ MAHAL PALACE — AI CONCIERGE                           ║
 ║   Grounded Hotel RAG Bot                                        ║
 ║   Stack: Python · FAISS · Groq (Llama-3) · Streamlit           ║
+║   Translation: googletrans (auto-detect → English)              ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Features:
@@ -10,7 +11,8 @@ Features:
   • Anti-hallucination guardrails (price / payment link guard)
   • Multi-turn conversation with context window
   • Intent classification: booking | amenity | complaint | staff | other
-  • Multilingual: English, Hindi, Hinglish
+  • Multilingual: any language → translated to English → fed to LLM
+  • LLM responds in the user's original language
   • Eval harness with 10 questions (including trap questions)
   • Holographic-glass Streamlit UI
 """
@@ -23,6 +25,7 @@ import streamlit as st
 from groq import Groq
 import faiss
 from sentence_transformers import SentenceTransformer
+from googletrans import Translator
 
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
 
@@ -33,6 +36,56 @@ TOP_K          = 5                             # retrieved chunks per query
 CHUNK_SIZE     = 350                           # words per chunk
 CHUNK_OVERLAP  = 50                            # overlap words
 MAX_HISTORY    = 6                             # turns kept in prompt context
+
+# ─── GOOGLE TRANSLATE INSTANCE ───────────────────────────────────────────────
+
+translator = Translator()
+
+
+def translate_to_english(text: str) -> tuple[str, str]:
+    """
+    Detects language of `text` and translates to English.
+    Returns (english_text, detected_language_code).
+    If already English or translation fails, returns original text + 'en'.
+    """
+    try:
+        detected = translator.detect(text)
+        lang_code = detected.lang if detected else "en"
+
+        # Handle list response from some googletrans versions
+        if isinstance(lang_code, list):
+            lang_code = lang_code[0]
+
+        if lang_code == "en":
+            return text, "en"
+
+        result = translator.translate(text, src=lang_code, dest="en")
+        translated = result.text if result and result.text else text
+        return translated, lang_code
+
+    except Exception:
+        # Fallback: return original text unchanged
+        return text, "en"
+
+
+def get_language_name(lang_code: str) -> str:
+    """Return a readable language name from ISO code."""
+    lang_map = {
+        "hi": "Hindi",
+        "en": "English",
+        "fr": "French",
+        "de": "German",
+        "es": "Spanish",
+        "ar": "Arabic",
+        "zh-cn": "Chinese",
+        "ja": "Japanese",
+        "ko": "Korean",
+        "pt": "Portuguese",
+        "ru": "Russian",
+        "it": "Italian",
+    }
+    return lang_map.get(lang_code, lang_code.upper())
+
 
 # ─── PRICE / PAYMENT GUARDRAIL PATTERNS ────────────────────────────────────
 
@@ -75,11 +128,9 @@ def guardrail_check(response: str) -> tuple[bool, str]:
     for pattern in PRICE_PATTERNS:
         match = re.search(pattern, lower)
         if match:
-            # Allow if it's a known-safe contextual phrase
             surrounding = lower[max(0, match.start()-60):match.end()+60]
             if any(safe in surrounding for safe in SAFE_PRICE_PHRASES):
                 continue
-            # Flag it
             return False, (
                 "⚠️ **Guardrail activated** — I don't have verified current pricing "
                 "in my knowledge base. Exact rates change with dates and availability.\n\n"
@@ -123,14 +174,14 @@ def build_index():
     # Normalize for cosine similarity via inner product
     faiss.normalize_L2(embeddings)
     dim   = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)  # Inner Product = cosine after L2 norm
+    index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
     return index, chunks, model
 
 
 def retrieve(query: str, index, chunks: list[str], model, k: int = TOP_K) -> list[str]:
-    """Embed query, search FAISS, return top-k chunks."""
+    """Embed query (English), search FAISS, return top-k chunks."""
     q_emb = model.encode([query], show_progress_bar=False)
     q_emb = np.array(q_emb, dtype=np.float32)
     faiss.normalize_L2(q_emb)
@@ -193,9 +244,9 @@ CORE RULES (non-negotiable):
 2. NEVER quote specific room prices, nightly rates, or current promotional pricing. Rates are dynamic. Always direct pricing queries to: +91-22-6665-3366 or tmpm.reservations@tajhotels.com
 3. NEVER generate, suggest, or infer payment links, booking URLs with transaction capability, or any payment portal. Direct all bookings to official channels.
 4. If the answer is not in the CONTEXT, say clearly: "I don't have that specific information in my knowledge base. For this, I'd recommend speaking with our reservations team at +91-22-6665-3366."
-5. Respond in the same language as the user — English, Hindi, or Hinglish — naturally and fluently.
+5. IMPORTANT — LANGUAGE: The user's original message was in {user_language}. You MUST respond in {user_language}, not in English (unless the user wrote in English).
 6. Be warm and elegant — you represent a 120+ year legacy of Indian hospitality.
-7.If question not related to hotel, politely decline and steer back to hotel-related topics.
+7. If question is not related to the hotel, politely decline and steer back to hotel-related topics.
 
 CONTEXT (retrieved from knowledge base):
 {context}
@@ -203,13 +254,15 @@ CONTEXT (retrieved from knowledge base):
 CONVERSATION HISTORY:
 {history}
 
-Respond to the user's latest message thoughtfully and accurately, staying strictly within the context provided."""
+Respond to the user's latest message thoughtfully and accurately, staying strictly within the context provided. Remember: reply in {user_language}."""
 
 
 # ─── GROQ CALL ────────────────────────────────────────────────────────────────
 
 def generate_response(
-    query: str,
+    original_query: str,
+    translated_query: str,
+    detected_lang: str,
     context_chunks: list[str],
     history: list[dict],
     groq_client: Groq,
@@ -220,13 +273,20 @@ def generate_response(
         role = "Guest" if turn["role"] == "user" else "Concierge"
         hist_str += f"{role}: {turn['content']}\n"
 
-    prompt = SYSTEM_PROMPT.format(context=context, history=hist_str)
+    user_language = get_language_name(detected_lang)
+
+    prompt = SYSTEM_PROMPT.format(
+        context=context,
+        history=hist_str,
+        user_language=user_language,
+    )
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user",   "content": query},
+            # Feed the English translation to the LLM for accurate RAG matching
+            {"role": "user",   "content": translated_query},
         ],
         temperature=0.3,
         max_tokens=1024,
@@ -237,7 +297,6 @@ def generate_response(
 # ─── EVALUATION HARNESS ──────────────────────────────────────────────────────
 
 EVAL_QUESTIONS = [
-    # ── IN-KB QUESTIONS ──────────────────────────────────────────────────────
     {
         "id": "E01",
         "category": "✅ Factual (in KB)",
@@ -287,7 +346,6 @@ EVAL_QUESTIONS = [
         "expected_keywords": ["नहीं", "not permitted", "outside food"],
         "trap": False,
     },
-    # ── TRAP QUESTIONS (not in KB — must trigger guardrail / honest refusal) ──
     {
         "id": "E08",
         "category": "🚨 TRAP — Price inquiry",
@@ -320,17 +378,26 @@ def run_eval(index, chunks, model, groq_client) -> list[dict]:
     results = []
     for q in EVAL_QUESTIONS:
         start = time.time()
-        retrieved = retrieve(q["question"], index, chunks, model)
-        raw_response = generate_response(q["question"], retrieved, [], groq_client)
+
+        # Translate question to English before retrieval
+        translated_q, detected_lang = translate_to_english(q["question"])
+
+        retrieved = retrieve(translated_q, index, chunks, model)
+        raw_response = generate_response(
+            original_query=q["question"],
+            translated_query=translated_q,
+            detected_lang=detected_lang,
+            context_chunks=retrieved,
+            history=[],
+            groq_client=groq_client,
+        )
         is_safe, final_response = guardrail_check(raw_response)
         latency = round(time.time() - start, 2)
 
-        # Score: keyword hit check
         resp_lower = final_response.lower()
         kw_hits = sum(1 for kw in q["expected_keywords"] if kw.lower() in resp_lower)
         score = round(kw_hits / len(q["expected_keywords"]), 2)
 
-        # For trap questions, also check guardrail fired
         if q["trap"] and q["trap_type"] == "price_hallucination":
             guardrail_fired = not is_safe or "guardrail" in resp_lower or "don't have" in resp_lower
         elif q["trap"] and q["trap_type"] == "payment_link":
@@ -342,6 +409,8 @@ def run_eval(index, chunks, model, groq_client) -> list[dict]:
             "id":               q["id"],
             "category":         q["category"],
             "question":         q["question"],
+            "translated_q":     translated_q,
+            "detected_lang":    get_language_name(detected_lang),
             "response":         final_response,
             "score":            score,
             "latency":          latency,
@@ -362,7 +431,6 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    # ── HOLOGRAPHIC / LUXURY DARK CSS ──────────────────────────────────────
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Raleway:wght@300;400;500;600&display=swap');
@@ -390,7 +458,6 @@ def main():
         border-right: 1px solid var(--border);
     }
 
-    /* Header */
     .taj-header {
         text-align: center;
         padding: 2rem 1rem 1.5rem;
@@ -423,7 +490,6 @@ def main():
         margin-top: 0.3rem;
     }
 
-    /* Chat bubbles */
     .msg-user {
         background: linear-gradient(135deg, rgba(201,169,110,0.15), rgba(201,169,110,0.05));
         border: 1px solid rgba(201,169,110,0.3);
@@ -460,7 +526,27 @@ def main():
     .role-user { color: var(--gold2); }
     .role-bot  { color: var(--gold); }
 
-    /* Intent badge */
+    .lang-tag {
+        display: inline-block;
+        font-size: 0.65rem;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        padding: 0.15rem 0.55rem;
+        border-radius: 20px;
+        margin-bottom: 0.4rem;
+        background: rgba(201,169,110,0.12);
+        border: 1px solid rgba(201,169,110,0.35);
+        color: var(--gold2);
+    }
+
+    .translated-hint {
+        font-size: 0.72rem;
+        color: var(--subtle);
+        font-style: italic;
+        margin-bottom: 0.4rem;
+    }
+
     .intent-badge {
         display: inline-block;
         font-size: 0.68rem;
@@ -474,7 +560,6 @@ def main():
         opacity: 0.85;
     }
 
-    /* Holographic eval card */
     .eval-card {
         background: linear-gradient(135deg, rgba(201,169,110,0.05), rgba(26,26,40,0.8));
         border: 1px solid var(--border);
@@ -495,7 +580,6 @@ def main():
     .eval-a   { font-size: 0.88rem; color: var(--text); opacity: 0.9; line-height: 1.6; }
     .eval-meta { font-size: 0.72rem; color: var(--subtle); margin-top: 0.6rem; }
 
-    /* Score bar */
     .score-bar {
         height: 4px;
         border-radius: 2px;
@@ -513,7 +597,6 @@ def main():
         border: 2px solid var(--gold);
     }
 
-    /* Sidebar items */
     .sidebar-stat {
         background: var(--glass);
         border: 1px solid var(--border);
@@ -525,7 +608,6 @@ def main():
     .sidebar-stat .label { color: var(--subtle); font-size: 0.7rem; letter-spacing: 0.2em; text-transform: uppercase; }
     .sidebar-stat .value { color: var(--gold); font-weight: 600; margin-top: 0.2rem; }
 
-    /* Input area */
     .stTextInput input, .stTextArea textarea {
         background: var(--dark3) !important;
         border: 1px solid var(--border) !important;
@@ -537,7 +619,6 @@ def main():
         box-shadow: 0 0 0 2px rgba(201,169,110,0.15) !important;
     }
 
-    /* Buttons */
     .stButton > button {
         background: linear-gradient(135deg, rgba(201,169,110,0.2), rgba(201,169,110,0.1)) !important;
         border: 1px solid var(--gold) !important;
@@ -553,24 +634,19 @@ def main():
         box-shadow: 0 0 20px rgba(201,169,110,0.2) !important;
     }
 
-    /* Divider */
     hr { border-color: var(--border) !important; opacity: 0.5; }
 
-    /* Tab styling */
     [data-baseweb="tab-list"] { background: transparent !important; border-bottom: 1px solid var(--border); }
     [data-baseweb="tab"] { color: var(--subtle) !important; font-family: 'Raleway', sans-serif !important; letter-spacing: 0.1em; }
     [aria-selected="true"] { color: var(--gold) !important; border-bottom: 2px solid var(--gold) !important; }
 
-    /* Scrollbar */
     ::-webkit-scrollbar { width: 4px; }
     ::-webkit-scrollbar-track { background: var(--dark); }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
-    /* Success / error states */
     .guardrail-ok   { color: #22C55E; font-size: 0.75rem; }
     .guardrail-fail { color: #EF4444; font-size: 0.75rem; }
 
-    /* Hologram glow effect on header */
     @keyframes holo-pulse {
         0%, 100% { text-shadow: 0 0 30px rgba(201,169,110,0.3); }
         50% { text-shadow: 0 0 60px rgba(201,169,110,0.6), 0 0 100px rgba(201,169,110,0.2); }
@@ -613,12 +689,16 @@ def main():
             <div class='value'>Groq · Llama-3.3-70B</div>
         </div>
         <div class='sidebar-stat'>
+            <div class='label'>Translation</div>
+            <div class='value'>googletrans → English</div>
+        </div>
+        <div class='sidebar-stat'>
             <div class='label'>Guardrail</div>
             <div class='value'>Price & Payment Guard</div>
         </div>
         <div class='sidebar-stat'>
             <div class='label'>Languages</div>
-            <div class='value'>EN · HI · Hinglish</div>
+            <div class='value'>Any → EN (auto-detect)</div>
         </div>
         <div class='sidebar-stat'>
             <div class='label'>Knowledge Base</div>
@@ -652,7 +732,6 @@ def main():
     # ── TABS ───────────────────────────────────────────────────────────────
     tab_chat, tab_eval, tab_about = st.tabs(["💬  Concierge Chat", "📊  Evaluation Suite", "ℹ️  System Info"])
 
-    # Initialise index & session state
     if not groq_key:
         st.info("🔑 Please enter your Groq API key in the sidebar to begin.", icon="🏛️")
         st.stop()
@@ -668,7 +747,6 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     with tab_chat:
 
-        # Welcome message
         if not st.session_state.messages:
             st.markdown("""
             <div class='msg-assistant'>
@@ -676,7 +754,7 @@ def main():
                 Namaste and welcome to The Taj Mahal Palace, Mumbai. 🙏<br><br>
                 I am your personal AI concierge — here to assist you with information about our hotel,
                 rooms, dining, wellness, history, and guest services.<br><br>
-                You may speak with me in <strong>English, Hindi, or Hinglish</strong>.
+                You may speak with me in <strong>any language</strong> — I will understand and reply in kind.
                 How may I assist you today?
             </div>
             """, unsafe_allow_html=True)
@@ -686,11 +764,18 @@ def main():
             if msg["role"] == "user":
                 intent = classify_intent(msg["content"])
                 emoji, label, color = INTENT_LABELS[intent]
+                lang_display = msg.get("lang_name", "")
+                translated_display = msg.get("translated", "")
+                translated_hint = ""
+                if translated_display and lang_display != "English":
+                    translated_hint = f"<div class='translated-hint'>🌐 Translated to English: \"{translated_display}\"</div>"
+                lang_tag = f"<span class='lang-tag'>🌍 {lang_display}</span> " if lang_display and lang_display != "English" else ""
                 st.markdown(f"""
                 <div class='msg-user'>
                     <div class='msg-role role-user'>GUEST</div>
-                    <span class='intent-badge' style='color:{color};border-color:{color};'>{emoji} {label}</span><br>
-                    {msg["content"]}
+                    {lang_tag}<span class='intent-badge' style='color:{color};border-color:{color};'>{emoji} {label}</span>
+                    {translated_hint}
+                    <div style='margin-top:0.3rem;'>{msg["content"]}</div>
                 </div>""", unsafe_allow_html=True)
             else:
                 st.markdown(f"""
@@ -704,36 +789,60 @@ def main():
         with col_in:
             user_input = st.text_input(
                 "Message",
-                placeholder="Ask me anything about the Taj Mahal Palace… (English / Hindi / Hinglish)",
+                placeholder="Ask in any language — English, Hindi, French, Arabic, Japanese…",
                 label_visibility="collapsed",
                 key="chat_input",
             )
         with col_btn:
             send = st.button("Send ✦", use_container_width=True)
 
-        # Example prompts
         st.markdown("""
         <div style='font-size:0.72rem; color:#6B7280; margin-top:0.5rem;'>
         Try: "What restaurants are in the hotel?" &nbsp;·&nbsp;
         "Kya pool hai?" &nbsp;·&nbsp;
         "Tell me about the Tata Suite" &nbsp;·&nbsp;
-        "What time is check-in?" &nbsp;·&nbsp;
-        "क्या वाई-फ़ाई मुफ़्त है?"
+        "क्या वाई-फ़ाई मुफ़्त है?" &nbsp;·&nbsp;
+        "Quel est l'horaire du spa?" &nbsp;·&nbsp;
+        "スパの営業時間は？"
         </div>
         """, unsafe_allow_html=True)
 
         if send and user_input.strip():
-            st.session_state.messages.append({"role": "user", "content": user_input.strip()})
+            raw_input = user_input.strip()
 
+            # ── STEP 1: Translate to English ────────────────────────────
+            with st.spinner("🌐 Detecting language…"):
+                translated_input, detected_lang = translate_to_english(raw_input)
+                lang_name = get_language_name(detected_lang)
+
+            # Save user message with metadata
+            st.session_state.messages.append({
+                "role": "user",
+                "content": raw_input,
+                "translated": translated_input,
+                "lang_name": lang_name,
+            })
+
+            # ── STEP 2: Retrieve using English translation ───────────────
             with st.spinner("✦ Consulting the knowledge archive…"):
-                retrieved = retrieve(user_input.strip(), index, chunks, embed_model)
-                raw       = generate_response(user_input.strip(), retrieved, st.session_state.messages[:-1], groq_client)
-                is_safe, final = guardrail_check(raw)
+                retrieved = retrieve(translated_input, index, chunks, embed_model)
+                raw_resp  = generate_response(
+                    original_query=raw_input,
+                    translated_query=translated_input,
+                    detected_lang=detected_lang,
+                    context_chunks=retrieved,
+                    history=[m for m in st.session_state.messages[:-1]],
+                    groq_client=groq_client,
+                )
+                is_safe, final = guardrail_check(raw_resp)
 
             st.session_state.messages.append({"role": "assistant", "content": final})
 
             if not is_safe:
                 st.toast("🛡️ Guardrail activated — price/payment info blocked", icon="⚠️")
+
+            if detected_lang != "en":
+                st.toast(f"🌍 Detected language: {lang_name} → translated to English for retrieval", icon="🌐")
 
             st.rerun()
 
@@ -747,11 +856,11 @@ def main():
         </div>
         <div style='color:#8A8070; font-size:0.82rem; margin-bottom:1.5rem;'>
             10 curated questions — 7 grounded (in-KB) + 3 trap questions designed to test
-            hallucination and guardrail robustness.
+            hallucination and guardrail robustness. Hindi/Hinglish questions are auto-translated
+            to English via googletrans before retrieval.
         </div>
         """, unsafe_allow_html=True)
 
-        # Show questions preview
         st.markdown("#### 📋 Eval Set")
         for q in EVAL_QUESTIONS:
             trap_tag = " 🚨 **TRAP**" if q["trap"] else ""
@@ -768,13 +877,11 @@ def main():
         if st.button("▶  Run Full Evaluation", use_container_width=True):
             with st.spinner("🔬 Running evaluation — this may take ~60 seconds…"):
                 results = run_eval(index, chunks, embed_model, groq_client)
-
             st.session_state["eval_results"] = results
 
         if "eval_results" in st.session_state:
             results = st.session_state["eval_results"]
 
-            # Summary metrics
             avg_score   = round(sum(r["score"] for r in results) / len(results), 2)
             avg_latency = round(sum(r["latency"] for r in results) / len(results), 2)
             trap_pass   = sum(1 for r in results if r["trap"] and r["guardrail_fired"] is not False)
@@ -796,10 +903,15 @@ def main():
                     guard_str = "<span class='guardrail-fail'>⚠️ Guardrail FAILED</span>"
 
                 score_pct = int(r["score"] * 100)
+                translated_row = ""
+                if r.get("detected_lang") and r["detected_lang"] != "English":
+                    translated_row = f"🌐 Detected: <strong>{r['detected_lang']}</strong> → Translated: <em>{r['translated_q']}</em><br>"
+
                 st.markdown(f"""
                 <div class='eval-card'>
                     <div style='font-size:0.7rem; color:#8A8070; letter-spacing:0.15em;'>{r['id']} · {r['category']}{trap_marker}</div>
                     <div class='eval-q'>❝ {r['question']} ❞</div>
+                    <div class='eval-meta' style='margin-bottom:0.5rem;'>{translated_row}</div>
                     <div class='eval-a'>{r['response'][:600]}{'…' if len(r['response'])>600 else ''}</div>
                     <div class='score-bar'><div class='score-marker' style='left:{score_pct}%;'></div></div>
                     <div class='eval-meta'>
@@ -811,7 +923,6 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Export
             st.download_button(
                 "⬇️  Export Results as JSON",
                 data=json.dumps(results, indent=2, ensure_ascii=False),
@@ -831,46 +942,52 @@ def main():
 
         st.markdown("""
         ```
-        ┌──────────────────────────────────────────────────────────────┐
-        │              TAJ MAHAL PALACE — RAG CONCIERGE                │
-        │                                                              │
-        │  ┌─────────────┐    ┌──────────────┐    ┌────────────────┐ │
-        │  │  Knowledge  │───▶│   Chunker    │───▶│ SentenceTrans  │ │
-        │  │    Base     │    │ (350w/50 ol) │    │  MiniLM-L6-v2  │ │
-        │  └─────────────┘    └──────────────┘    └───────┬────────┘ │
-        │                                                  │          │
-        │                                          ┌───────▼────────┐ │
-        │                                          │  FAISS IndexIP │ │
-        │                                          │  (cosine sim)  │ │
-        │                                          └───────┬────────┘ │
-        │                                                  │          │
-        │  ┌──────────┐    ┌──────────────┐    ┌──────────▼───────┐ │
-        │  │  Query   │───▶│ Intent Class │    │  Top-K Retrieval │ │
-        │  │(EN/HI/HG)│    │  (regex+kw) │    │     (k=5)        │ │
-        │  └──────────┘    └──────────────┘    └──────────┬───────┘ │
-        │       │                                          │          │
-        │       └──────────────────────────────────────────┘          │
-        │                           │                                  │
-        │                  ┌────────▼────────┐                        │
-        │                  │  System Prompt  │                        │
-        │                  │ + Context + Hist│                        │
-        │                  └────────┬────────┘                        │
-        │                           │                                  │
-        │                  ┌────────▼────────┐                        │
-        │                  │  Groq API       │                        │
-        │                  │  Llama-3.3-70B  │                        │
-        │                  └────────┬────────┘                        │
-        │                           │                                  │
-        │                  ┌────────▼────────┐                        │
-        │                  │   GUARDRAIL     │  ← Price / Payment     │
-        │                  │   (regex scan)  │    Link Detection      │
-        │                  └────────┬────────┘                        │
-        │                           │                                  │
-        │                  ┌────────▼────────┐                        │
-        │                  │   Response to   │                        │
-        │                  │     User        │                        │
-        │                  └─────────────────┘                        │
-        └──────────────────────────────────────────────────────────────┘
+        ┌──────────────────────────────────────────────────────────────────┐
+        │              TAJ MAHAL PALACE — RAG CONCIERGE                    │
+        │                                                                  │
+        │  ┌─────────────┐    ┌──────────────┐    ┌────────────────────┐  │
+        │  │  Knowledge  │───▶│   Chunker    │───▶│  SentenceTrans     │  │
+        │  │    Base     │    │ (350w/50 ol) │    │  MiniLM-L6-v2      │  │
+        │  └─────────────┘    └──────────────┘    └─────────┬──────────┘  │
+        │                                                    │             │
+        │                                          ┌─────────▼──────────┐  │
+        │                                          │   FAISS IndexIP    │  │
+        │                                          │   (cosine sim)     │  │
+        │                                          └─────────┬──────────┘  │
+        │                                                    │             │
+        │  ┌─────────────────┐    ┌──────────────┐          │             │
+        │  │  User Query     │───▶│  googletrans │          │             │
+        │  │ (any language)  │    │  auto-detect │          │             │
+        │  └─────────────────┘    └──────┬───────┘          │             │
+        │         │                      │ English           │             │
+        │         │               ┌──────▼───────┐  ┌───────▼──────────┐ │
+        │         │               │ Intent Class │  │  Top-K Retrieval │ │
+        │         │               │  (regex+kw)  │  │      (k=5)       │ │
+        │         │               └──────────────┘  └───────┬──────────┘ │
+        │         │                                          │             │
+        │         └──────────────────────────────────────────┘             │
+        │                                   │                              │
+        │                          ┌─────────▼────────┐                   │
+        │                          │   System Prompt   │                   │
+        │                          │ + Context + Hist  │                   │
+        │                          │ + lang instruction│                   │
+        │                          └─────────┬─────────┘                  │
+        │                                    │                             │
+        │                          ┌─────────▼────────┐                   │
+        │                          │   Groq API        │                   │
+        │                          │   Llama-3.3-70B   │                   │
+        │                          └─────────┬─────────┘                  │
+        │                                    │                             │
+        │                          ┌─────────▼────────┐                   │
+        │                          │    GUARDRAIL      │ ← Price/Payment   │
+        │                          │   (regex scan)    │   Link Detection  │
+        │                          └─────────┬─────────┘                  │
+        │                                    │                             │
+        │                          ┌─────────▼────────┐                   │
+        │                          │  Response in      │                   │
+        │                          │  User's Language  │                   │
+        │                          └──────────────────┘                   │
+        └──────────────────────────────────────────────────────────────────┘
         ```
         """)
 
@@ -880,6 +997,7 @@ def main():
             st.markdown("""
             | Component | Technology |
             |-----------|-----------|
+            | Translation | googletrans (auto-detect → EN) |
             | Embeddings | sentence-transformers/all-MiniLM-L6-v2 |
             | Vector DB | FAISS IndexFlatIP (cosine) |
             | LLM | Groq · llama-3.3-70b-versatile |
@@ -889,32 +1007,37 @@ def main():
             """)
 
         with col2:
-            st.markdown("**Guardrail Design**")
+            st.markdown("**Translation Flow**")
             st.markdown("""
-            The anti-hallucination guardrail works on **two layers**:
+            Every user message passes through **three stages**:
 
-            1. **Prompt-level**: The system prompt explicitly forbids inventing prices or payment links, grounding the LLM to provided context only.
+            1. **Language Detection** — `googletrans` auto-detects the input language (Hindi, French, Arabic, Japanese, etc.)
 
-            2. **Post-generation scan**: Every response is scanned via regex for price patterns (`₹NNN`, `USD NNN`, `costs NNN`) and payment link patterns. If found and not matching a known safe phrase, the response is replaced with a redirect to the human reservations team.
+            2. **Translation to English** — The message is translated to English before being embedded and used for FAISS retrieval. This ensures the English-trained `all-MiniLM-L6-v2` model produces accurate semantic matches against the English knowledge base.
 
-            **Trap question handling**: Questions about real-time data (current TripAdvisor score), exact prices, or payment links are guaranteed to trigger the redirect — never a hallucinated answer.
+            3. **Reply in User's Language** — The system prompt instructs the LLM to respond in the detected language, so the guest always receives a reply in their own tongue.
+
+            **Why translate?** The embedding model was trained primarily on English corpora. Hindi or French queries in their original form produce weaker cosine similarity scores against an English KB — translating to English before retrieval significantly improves top-K chunk quality.
             """)
 
         st.markdown("**KB Stats**")
-        with open(KB_PATH, "r", encoding="utf-8") as f:
-            kb_text = f.read()
-        word_count = len(kb_text.split())
-        chunk_count = len(chunk_text(kb_text))
-        st.markdown(f"""
-        | Metric | Value |
-        |--------|-------|
-        | KB Size | {len(kb_text):,} characters |
-        | KB Words | {word_count:,} words |
-        | Chunks (350w, 50 overlap) | {chunk_count} chunks |
-        | Embedding Dim | 384 (MiniLM-L6-v2) |
-        | Top-K Retrieval | {TOP_K} chunks |
-        | Max History | {MAX_HISTORY} turns |
-        """)
+        try:
+            with open(KB_PATH, "r", encoding="utf-8") as f:
+                kb_text = f.read()
+            word_count  = len(kb_text.split())
+            chunk_count = len(chunk_text(kb_text))
+            st.markdown(f"""
+            | Metric | Value |
+            |--------|-------|
+            | KB Size | {len(kb_text):,} characters |
+            | KB Words | {word_count:,} words |
+            | Chunks (350w, 50 overlap) | {chunk_count} chunks |
+            | Embedding Dim | 384 (MiniLM-L6-v2) |
+            | Top-K Retrieval | {TOP_K} chunks |
+            | Max History | {MAX_HISTORY} turns |
+            """)
+        except FileNotFoundError:
+            st.warning(f"`{KB_PATH}` not found. Place the knowledge base file in the same directory.")
 
 
 # ─── ENTRY POINT ──────────────────────────────────────────────────────────────
